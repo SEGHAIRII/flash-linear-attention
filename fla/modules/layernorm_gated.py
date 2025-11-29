@@ -64,6 +64,7 @@ def layer_norm_fwd_kernel(
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
+    activation:tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -83,7 +84,10 @@ def layer_norm_fwd_kernel(
     x = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
     if HAS_Z and not NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=cols < N).to(tl.float32)
-        x *= z * tl.sigmoid(z)
+        if activation == "silu":
+            x *= z * tl.sigmoid(z)
+        elif activation == "relu":
+            x *= tl.relu(z)
     if not IS_RMS_NORM:
         mean = tl.sum(x, axis=0) / N
         tl.store(Mean + row, mean)
@@ -103,7 +107,10 @@ def layer_norm_fwd_kernel(
     y = x_hat * w + b if HAS_BIAS else x_hat * w
     if HAS_Z and NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
-        y *= z * tl.sigmoid(z)
+        if activation == "silu":
+            y *= z * tl.sigmoid(z)
+        elif activation == "relu":
+            y *= tl.relu(z)
     # Write output
     tl.store(Y + cols, y, mask=mask)
 
@@ -118,6 +125,7 @@ def layer_norm_fwd(
     group_size: int = None,
     norm_before_gate: bool = True,
     is_rms_norm: bool = False,
+    activation:str="silu",
 ):
     M, N = x.shape
     if group_size is None:
@@ -166,7 +174,8 @@ def layer_norm_fwd(
         BLOCK_N=BLOCK_N,
         NORM_BEFORE_GATE=norm_before_gate,
         IS_RMS_NORM=is_rms_norm,
-        num_warps=num_warps
+        num_warps=num_warps,
+        activation=activation
     )
     return out, mean, rstd
 
@@ -208,6 +217,7 @@ def layer_norm_bwd_kernel(
     HAS_Z: tl.constexpr,
     RECOMPUTE_OUTPUT: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    activation:tl.constexpr,
 ):
     # Map the program id to the elements of X, DX, and DY it should compute.
     row_block_id = tl.program_id(0)
@@ -244,20 +254,36 @@ def layer_norm_bwd_kernel(
         if HAS_Z and not NORM_BEFORE_GATE:
             z = tl.load(Z + cols, mask=mask, other=0.).to(tl.float32)
             x_og = x
-            x = x_og * z * tl.sigmoid(z)
+            if activation == 'silu' or activation == 'swish':
+                x = x_og * z * tl.sigmoid(z)
+            elif activation == 'relu':
+                x = x_og * tl.relu(z)
         rstd = tl.load(Rstd + row)
         # Compute dx
         xhat = (x - mean) * rstd if not IS_RMS_NORM else x * rstd
         xhat = tl.where(mask, xhat, 0.)
         if HAS_Z and NORM_BEFORE_GATE:
             z = tl.load(Z + cols, mask=mask, other=0.).to(tl.float32)
-            z_sigmoid = tl.sigmoid(z)
             y = xhat * w + b if HAS_BIAS else xhat * w
             if RECOMPUTE_OUTPUT:
-                tl.store(Y + cols, y * z * z_sigmoid, mask=mask)
-            dz = dy * y * z_sigmoid * (1 + z * (1 - z_sigmoid))
+                if activation == "silu":
+                    z_sigmoid = tl.sigmoid(z)
+                    tl.store(Y + cols, y * z * z_sigmoid, mask=mask)
+                elif activation == "relu":
+                    tl.store(Y + cols, y * tl.relu(z), mask=mask)
+            # Compute dz based on activation function
+            if activation == "silu":
+                z_sigmoid = tl.sigmoid(z)
+                dz = dy * y * z_sigmoid * (1 + z * (1 - z_sigmoid))  # SiLU derivative
+            elif activation == "relu":
+                dz = dy * y * (z > 0).to(tl.float32)  # ReLU derivative
             tl.store(DZ + cols, dz, mask=mask)
-            dy *= z * z_sigmoid
+            # Update dy
+            if activation == "silu":
+                z_sigmoid = tl.sigmoid(z)
+                dy *= z * z_sigmoid
+            elif activation == "relu":
+                dy *= tl.relu(z)
         else:
             if RECOMPUTE_OUTPUT:
                 y = xhat * w + b if HAS_BIAS else xhat * w
@@ -273,10 +299,19 @@ def layer_norm_bwd_kernel(
         if HAS_BIAS:
             db += dy
         if HAS_Z and not NORM_BEFORE_GATE:
-            z_sigmoid = tl.sigmoid(z)
-            dz = dx * x_og * z_sigmoid * (1 + z * (1 - z_sigmoid))
+            # Compute dz based on activation function
+            if activation == "silu":
+                z_sigmoid = tl.sigmoid(z)
+                dz = dx * x_og * z_sigmoid * (1 + z * (1 - z_sigmoid))  # SiLU derivative
+            elif activation == "relu":
+                dz = dx * x_og * (z > 0).to(tl.float32)  # ReLU derivative
             tl.store(DZ + cols, dz, mask=mask)
-            dx *= z * z_sigmoid
+            # Update dx
+            if activation == "silu":
+                z_sigmoid = tl.sigmoid(z)
+                dx *= z * z_sigmoid
+            elif activation == "relu":
+                dx *= tl.relu(z)
         # Write dx
         tl.store(DX + cols, dx, mask=mask)
 
@@ -308,6 +343,7 @@ def layer_norm_bwd(
     recompute_output: bool = False,
     dz: torch.Tensor = None,
     out: torch.Tensor = None,
+    activation:str="silu",
 ):
     M, N = x.shape
     if group_size is None:
@@ -379,7 +415,8 @@ def layer_norm_bwd(
         BLOCK_N=BLOCK_N,
         NORM_BEFORE_GATE=norm_before_gate,
         IS_RMS_NORM=is_rms_norm,
-        num_warps=num_warps
+        num_warps=num_warps,
+        activation=activation
     )
     dw = _dw.sum(0).to(weight.dtype)
     db = _db.sum(0).to(bias.dtype) if bias is not None else None
@@ -391,7 +428,7 @@ class LayerNormFn(torch.autograd.Function):
     @input_guard
     @staticmethod
     def forward(ctx, x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True,
-                is_rms_norm=False):
+                is_rms_norm=False, activation:str="silu"):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))
         """
 
@@ -417,6 +454,7 @@ class LayerNormFn(torch.autograd.Function):
             group_size=group_size,
             norm_before_gate=norm_before_gate,
             is_rms_norm=is_rms_norm,
+            activation=activation
         )
         ctx.save_for_backward(x, weight, bias, mean, rstd, z)
         ctx.x_shape_og = x_shape_og
@@ -424,6 +462,7 @@ class LayerNormFn(torch.autograd.Function):
         ctx.group_size = group_size
         ctx.norm_before_gate = norm_before_gate
         ctx.is_rms_norm = is_rms_norm
+        ctx.activation = activation
         return y.reshape(x_shape_og)
 
     @input_guard
@@ -445,19 +484,20 @@ class LayerNormFn(torch.autograd.Function):
             z,
             ctx.group_size,
             ctx.norm_before_gate,
-            ctx.is_rms_norm
+            ctx.is_rms_norm,
+            ctx.activation
         )
         dx = dx.reshape(ctx.x_shape_og)
         dz = dz.reshape(ctx.x_shape_og) if dz is not None else None
-        return dx, dw, db, dz, None, None, None, None
+        return dx, dw, db, dz, None, None, None, None, None
 
 
 def layernorm_fn(x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True, is_rms_norm=False):
     return LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm)
 
 
-def rmsnorm_fn(x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True):
-    return LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, True)
+def rmsnorm_fn(x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True, activation:str="silu"):
+    return LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, True, activation)
 
 
 class LayerNormGated(nn.Module):
@@ -521,8 +561,8 @@ class RMSNormGated(nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
-    def forward(self, x, z=None):
+    def forward(self, x, z=None, activation:str="silu"):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))
         """
         return rmsnorm_fn(x, self.weight, self.bias, z=z, eps=self.eps, group_size=self.group_size,
-                          norm_before_gate=self.norm_before_gate)
+                          norm_before_gate=self.norm_before_gate, activation=activation)

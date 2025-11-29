@@ -155,6 +155,8 @@ class Mamba2Block(GradientCheckpointingLayer):
             norm_eps=config.norm_eps,
             layer_idx=layer_idx,
         )
+        if config.hidden_act == "relu":
+            self.relu = nn.ReLU()
 
     def forward(
         self,
@@ -165,6 +167,8 @@ class Mamba2Block(GradientCheckpointingLayer):
     ):
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
+        if self.config.hidden_act == "relu":
+            hidden_states = self.relu(hidden_states)
         if self.residual_in_fp32:
             residual = residual.to(torch.float32)
 

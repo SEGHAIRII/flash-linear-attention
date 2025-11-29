@@ -179,7 +179,7 @@ class Mamba2(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
         self.norm = RMSNormGated(
-            self.intermediate_size, eps=self.norm_eps, norm_before_gate=False
+            self.intermediate_size, eps=self.norm_eps, norm_before_gate=False,
         )
         self.D = nn.Parameter(torch.ones(self.num_heads))
         self.D._no_weight_decay = True
@@ -215,6 +215,9 @@ class Mamba2(nn.Module):
             self.causal_conv1d_fn = causal_conv1d_fn
             self.causal_conv1d_update = causal_conv1d_update
         self.backend = backend
+        
+        
+
 
     def cuda_kernels_forward(
         self,
@@ -224,6 +227,9 @@ class Mamba2(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
     ):
         # 1. Gated MLP's linear projection
+        
+        
+        
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         projected_states = self.in_proj(hidden_states)
 
@@ -238,6 +244,7 @@ class Mamba2(nn.Module):
         ) // 2
 
         # Single step calculations via cache
+        # relufication step 1 -> done
         if cache_params is not None and cache_position is not None and cache_position[0] > 0:
             _, _, gate, hidden_states_B_C, dt = projected_states.squeeze(1).split(
                 [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
@@ -295,7 +302,9 @@ class Mamba2(nn.Module):
             A = -torch.exp(self.A_log.float())  # (num_heads) or (intermediate_size, state_size)
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
-            # 2-4. Fused kernel for conv1d, SSM, and the final projection
+            # 2-4. Fused kernel for conv1d, SSM, and the final 
+            
+            # step 1 of relufication -> done
             if self.training and cache_params is None:
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
@@ -318,6 +327,8 @@ class Mamba2(nn.Module):
                     **dt_limit_kwargs,
                 )
 
+
+            # step 1 of relufication -> done
             else:
                 _, _, gate, hidden_states_B_C, dt = projected_states.split(
                     [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
@@ -335,7 +346,7 @@ class Mamba2(nn.Module):
                         layer_idx=self.layer_idx, new_conv_state=conv_states, cache_init=True
                     )
 
-                if self.activation not in ["silu", "swish"]:
+                if self.activation not in ["silu", "swish", "relu"]:
                     hidden_states_B_C = self.act(
                         self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2)
                     )
@@ -385,7 +396,7 @@ class Mamba2(nn.Module):
 
                 scan_output = scan_output.view(batch_size, seq_len, -1)
                 # Multiply "gate" branch and apply extra normalization layer
-                scan_output = self.norm(scan_output, gate)
+                scan_output = self.norm(scan_output, gate, activation=self.activation)
 
                 # 4. Final linear projection
                 out = self.out_proj(scan_output)
@@ -401,6 +412,7 @@ class Mamba2(nn.Module):
     ):
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
+        
 
         # 1. Gated MLP's linear projection
         input_states = apply_mask_to_padding_states(input_states, attention_mask)
